@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         $V2EX Scence +
 // @namespace    http://tampermonkey.net/
-// @version      1.4.3
-// @description  为 V2EX 增强场景化打赏、私信和聊天功能
+// @version      1.4.4
+// @description  为 V2EX 增强场景化打赏、私信、举报和聊天功能
 // @author       JoeJoeJoe
 // @match        https://www.v2ex.com/*
 // @match        https://*.v2ex.com/*
@@ -47,6 +47,15 @@
     const V2EX_MINT = '9raUVuzeWUk53co63M4WXLWPWE4Xc6Lpn7RS9dnkpump';
     // 消息成本
     const MESSAGE_COST = 1;
+    // 举报成本
+    const REPORT_COST = 5;
+    const REPORT_MAX_LENGTH = 100;
+    const REPORT_DEFAULT_MODERATOR = 'JoeJoeJoe';
+    const REPORT_STORAGE_KEY = 'v2ex-topic-report-prefs-v1';
+    const REPORT_FALLBACK_MODERATORS = [
+        'Livid', 'Olivia', 'sillydaddy', 'Tink', 'revival83',
+        'drymonfidelia', 'sparanoid', REPORT_DEFAULT_MODERATOR
+    ];
 
     // 用户地址缓存
     const addressCache = new Map();
@@ -62,6 +71,8 @@
     const QUICK_THANK_STORAGE_KEY = 'quick-thank-thanked-users-v1';
     // DM 模态元素
     let dmModalEl = null;
+    // 举报模态元素
+    let reportModalEl = null;
     // 打赏模态上下文
     let tipModalContext = null;
     // 快速感谢是否已初始化
@@ -86,6 +97,9 @@
     const RESIZE_ICON_URL = 'https://raw.githubusercontent.com/HelloWorldImJoe/TampermonkeyScripts/master/assets/resize.svg';
     // 在此对象中维护版本号到更新说明的映射，新增版本请追加条目
     const SCRIPT_CHANGELOG_ENTRIES = {
+        '1.4.4': [
+            '新增帖子举报功能，可选择管理员并通过支付 5 $V2EX 的私聊发送帖子地址和举报内容'
+        ],
         '1.4.3': [
             '过滤掉 *.v2ex.com/signin/* | 2fa 路径，避免在登录页面加载脚本引起问题'
         ],
@@ -615,7 +629,8 @@
         .dm-btn:hover { background: rgba(59,130,246,0.18); }
         .dm-btn.loading { opacity: 0.6; pointer-events: none; }
 
-        #dm-overlay {
+        #dm-overlay,
+        #report-overlay {
             display: none;
             position: fixed;
             inset: 0;
@@ -680,6 +695,34 @@
         .dm-btn-primary { background: var(--dm-accent); color: #fff; }
         .dm-btn-primary[disabled] { opacity: 0.6; cursor: not-allowed; }
         .dm-status { color: var(--dm-muted); font-size: 12px; }
+
+        .topic-report-button { margin-left: 10px; }
+        .report-modal .dm-field + .dm-field { margin-top: 16px; }
+        .report-modal .dm-field select {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid #1f2937;
+            background: #0f172a;
+            color: var(--dm-text);
+            font-size: 14px;
+            outline: none;
+        }
+        .report-modal .dm-field select:focus { border-color: var(--dm-accent); }
+        .report-modal .dm-field textarea { min-height: 110px; }
+        .report-count { float: right; }
+        .report-tip {
+            margin-top: 14px;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: rgba(245, 158, 11, 0.12);
+            color: #fbbf24;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+        .report-status.success { color: #34d399; }
+        .report-status.error { color: #f87171; }
 
         /* Quick Thank */
         .quick-thank-btn { cursor: pointer; }
@@ -2491,10 +2534,175 @@
         if (dmModalEl) dmModalEl.style.display = 'none';
     }
 
-    async function sendDmMessage({ username, address, text, onStatus }) {
+    function loadReportPreferences() {
+        const stored = safeJsonParse(localStorage.getItem(REPORT_STORAGE_KEY), {});
+        return {
+            moderator: typeof stored.moderator === 'string' && stored.moderator.trim()
+                ? stored.moderator.trim()
+                : REPORT_DEFAULT_MODERATOR,
+            content: typeof stored.content === 'string'
+                ? stored.content.slice(0, REPORT_MAX_LENGTH)
+                : ''
+        };
+    }
+
+    function saveReportPreferences(moderator, content) {
+        try {
+            localStorage.setItem(REPORT_STORAGE_KEY, JSON.stringify({
+                moderator: (moderator || REPORT_DEFAULT_MODERATOR).trim(),
+                content: (content || '').slice(0, REPORT_MAX_LENGTH)
+            }));
+        } catch (err) {
+            console.warn('保存举报设置失败:', err);
+        }
+    }
+
+    function getReportModerators(storedModerator) {
+        const moderatorBox = Array.from(document.querySelectorAll('#Rightbar .box')).find((box) =>
+            /Community Moderators|社区管理员/i.test(box.textContent || '')
+        );
+        const pageModerators = moderatorBox
+            ? Array.from(moderatorBox.querySelectorAll('a[href^="/member/"]')).map((link) => {
+                const match = link.getAttribute('href')?.match(/^\/member\/([^\/?#]+)/);
+                return match ? decodeURIComponent(match[1]) : '';
+            }).filter(Boolean)
+            : [];
+        return Array.from(new Set([
+            ...pageModerators,
+            ...REPORT_FALLBACK_MODERATORS,
+            storedModerator
+        ].filter(Boolean)));
+    }
+
+    function updateReportStatus(message, type = '') {
+        const statusEl = reportModalEl?.querySelector('#report-status');
+        if (!statusEl) return;
+        statusEl.className = `dm-status report-status${type ? ` ${type}` : ''}`;
+        statusEl.textContent = message;
+    }
+
+    function createReportModal() {
+        const overlay = document.createElement('div');
+        overlay.id = 'report-overlay';
+        overlay.innerHTML = `
+            <div class="dm-modal report-modal">
+                <div class="dm-head">举报帖子 · 5 $V2EX</div>
+                <div class="dm-body">
+                    <div class="dm-field">
+                        <label for="report-moderator">选择管理员</label>
+                        <select id="report-moderator"></select>
+                    </div>
+                    <div class="dm-field">
+                        <label for="report-content">举报内容（最多 100 字符）<span class="report-count" id="report-count">0/100</span></label>
+                        <textarea id="report-content" maxlength="100" placeholder="请简要说明举报原因..."></textarea>
+                    </div>
+                    <div class="report-tip">Tips：举报将通过私聊发送给所选管理员，并需要支付 5 $V2EX。点击确定后钱包会弹出支付确认。</div>
+                </div>
+                <div class="dm-foot">
+                    <div class="dm-status report-status" id="report-status">帖子地址会自动附在举报消息中</div>
+                    <div class="dm-actions">
+                        <button class="dm-btn-ghost" id="report-cancel">取消</button>
+                        <button class="dm-btn-primary" id="report-send">确定</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+        const moderatorEl = overlay.querySelector('#report-moderator');
+        const contentEl = overlay.querySelector('#report-content');
+        const countEl = overlay.querySelector('#report-count');
+        const persist = () => saveReportPreferences(moderatorEl.value, contentEl.value);
+        moderatorEl.addEventListener('change', persist);
+        contentEl.addEventListener('input', () => {
+            countEl.textContent = `${contentEl.value.length}/${REPORT_MAX_LENGTH}`;
+            persist();
+        });
+        overlay.addEventListener('click', (event) => {
+            if (event.target === overlay) closeReportModal();
+        });
+        overlay.querySelector('#report-cancel').addEventListener('click', closeReportModal);
+        overlay.querySelector('#report-send').addEventListener('click', handleReportSend);
+        return overlay;
+    }
+
+    function openReportModal() {
+        if (!reportModalEl) reportModalEl = createReportModal();
+        const preferences = loadReportPreferences();
+        const moderatorEl = reportModalEl.querySelector('#report-moderator');
+        const contentEl = reportModalEl.querySelector('#report-content');
+        const countEl = reportModalEl.querySelector('#report-count');
+        moderatorEl.replaceChildren(...getReportModerators(preferences.moderator).map((username) => {
+            const option = document.createElement('option');
+            option.value = username;
+            option.textContent = username;
+            return option;
+        }));
+        moderatorEl.value = preferences.moderator;
+        contentEl.value = preferences.content;
+        countEl.textContent = `${contentEl.value.length}/${REPORT_MAX_LENGTH}`;
+        const sendBtn = reportModalEl.querySelector('#report-send');
+        sendBtn.disabled = false;
+        sendBtn.textContent = '确定';
+        updateReportStatus('帖子地址会自动附在举报消息中');
+        reportModalEl.style.display = 'flex';
+        contentEl.focus();
+    }
+
+    function closeReportModal() {
+        if (reportModalEl) reportModalEl.style.display = 'none';
+    }
+
+    async function handleReportSend() {
+        const moderatorEl = reportModalEl?.querySelector('#report-moderator');
+        const contentEl = reportModalEl?.querySelector('#report-content');
+        const sendBtn = reportModalEl?.querySelector('#report-send');
+        if (!moderatorEl || !contentEl || !sendBtn) return;
+        const moderator = moderatorEl.value.trim();
+        const content = contentEl.value.trim();
+        if (!moderator) {
+            updateReportStatus('请选择管理员', 'error');
+            return;
+        }
+        if (!content) {
+            updateReportStatus('请输入举报内容', 'error');
+            return;
+        }
+        if (content.length > REPORT_MAX_LENGTH) {
+            updateReportStatus(`举报内容不能超过 ${REPORT_MAX_LENGTH} 字符`, 'error');
+            return;
+        }
+        saveReportPreferences(moderator, content);
+        sendBtn.disabled = true;
+        sendBtn.textContent = '发送中...';
+        try {
+            const address = await getUserAddress(moderator);
+            if (!address) throw new Error('该管理员未绑定 Solana 地址');
+            const topicUrl = `${window.location.origin}${window.location.pathname}`;
+            await sendDmMessage({
+                username: moderator,
+                address,
+                amount: REPORT_COST,
+                text: `举报帖子：${topicUrl}\n举报内容：${content}`,
+                onStatus: (message) => updateReportStatus(message)
+            });
+            updateReportStatus(`举报已成功发送给 @${moderator}，已支付 5 $V2EX`, 'success');
+        } catch (err) {
+            console.error('举报发送失败:', err);
+            updateReportStatus(`举报发送失败：${err.message || '请稍后重试'}`, 'error');
+        } finally {
+            sendBtn.disabled = false;
+            sendBtn.textContent = '确定';
+        }
+    }
+
+    async function sendDmMessage({ username, address, text, amount = MESSAGE_COST, onStatus }) {
         const content = (text || '').trim();
         if (!content || content.length < 3) {
             throw new Error('请至少输入 3 个字符');
+        }
+        const messageAmount = Number(amount);
+        if (!Number.isFinite(messageAmount) || messageAmount <= 0) {
+            throw new Error('私信费用无效');
         }
         const normalizedAddress = typeof address === 'string' ? address.trim() : '';
         if (!isSolAddress(normalizedAddress)) {
@@ -2519,13 +2727,13 @@
             throw new Error('未获取到钱包地址');
         }
         reportStatus('构建交易...');
-        const tx = await buildTransaction(from, normalizedAddress, MESSAGE_COST, V2EX_MINT);
+        const tx = await buildTransaction(from, normalizedAddress, messageAmount, V2EX_MINT);
         reportStatus('等待钱包签名...');
         const signature = await walletSignAndSendTransaction(tx);
         reportStatus('链上确认中...');
         await waitForTransaction(signature);
         const memo = content.slice(0, 180);
-        await submitMessageRecord({ signature, amount: MESSAGE_COST, memo, to: username });
+        await submitMessageRecord({ signature, amount: messageAmount, memo, to: username });
         return { signature, memo };
     }
 
@@ -5771,6 +5979,39 @@
         addProfileDmButton();
     }
 
+    function addTopicReportButton() {
+        if (!/^\/t\/\d+/.test(window.location.pathname)) return;
+        const topicBox = document.querySelector('#Main > .box') || document.querySelector('#Main .box');
+        if (!topicBox) return;
+        const actionPattern = /加入收藏|取消收藏|Tweet|忽略主题|感谢|分享|移动主题|Favorite|Ignore|Thank|Share/i;
+        const actionLinks = Array.from(topicBox.querySelectorAll('a')).filter((link) =>
+            !link.closest('.header, .topic_content, .markdown_body') &&
+            actionPattern.test(`${link.textContent || ''} ${link.title || ''}`)
+        );
+        const lastAction = actionLinks.at(-1);
+        if (!lastAction) return;
+        const actionBar = lastAction.closest('.topic_buttons') || lastAction.parentElement;
+        if (!actionBar) return;
+        const existingButton = document.getElementById('topic-report-button');
+        if (existingButton) {
+            existingButton.className = `${lastAction.className || ''} topic-report-button`.trim();
+            if (actionBar.lastElementChild !== existingButton) actionBar.appendChild(existingButton);
+            return;
+        }
+
+        const reportButton = document.createElement('a');
+        reportButton.id = 'topic-report-button';
+        reportButton.href = '#';
+        reportButton.className = `${lastAction.className || ''} topic-report-button`.trim();
+        reportButton.textContent = '举报(5$v2ex)';
+        reportButton.title = '举报(5$v2ex)';
+        reportButton.addEventListener('click', (event) => {
+            event.preventDefault();
+            openReportModal();
+        });
+        actionBar.appendChild(reportButton);
+    }
+
     // 为 Planet 主列表的主题卡片添加打赏 + 私信按钮
     function addPlanetPostTipButtons() {
         const posts = document.querySelectorAll('.planet-post');
@@ -5889,6 +6130,7 @@
         await loadSolanaLib();
         addTipButtons();
         addDmButtons();
+        addTopicReportButton();
         initQuickThank();
         initTipChat();
         scheduleScriptUpdateCheck();
@@ -5898,6 +6140,7 @@
         const observer = new MutationObserver(() => {
             addTipButtons();
             addDmButtons();
+            addTopicReportButton();
             quickThankCheckAndInsert();
             initTipChat();
         });
